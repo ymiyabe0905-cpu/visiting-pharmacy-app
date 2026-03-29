@@ -173,10 +173,21 @@ export default function ScanPage() {
         } else {
             // トリミング無効、または枠が指定されなかった場合は画像全体を高解像度で使用
             finalCanvas = document.createElement('canvas');
-            finalCanvas.width = imgRef.current.naturalWidth || imgRef.current.width;
-            finalCanvas.height = imgRef.current.naturalHeight || imgRef.current.height;
+            const nw = imgRef.current.naturalWidth || imgRef.current.width;
+            const nh = imgRef.current.naturalHeight || imgRef.current.height;
+            finalCanvas.width = nw;
+            finalCanvas.height = nh;
             const ctx = finalCanvas.getContext('2d');
-            ctx?.drawImage(imgRef.current, 0, 0, finalCanvas.width, finalCanvas.height);
+            ctx?.drawImage(imgRef.current, 0, 0, nw, nh);
+            
+            console.log('\n[DEBUG] buildFinalCanvas (Fallback/Full Mode):', {
+                disableCropping,
+                naturalWidth: imgRef.current.naturalWidth,
+                width: imgRef.current.width,
+                finalCanvasWidth: nw,
+                finalCanvasHeight: nh
+            });
+            console.log('[DEBUG] Target Canvas Size:', nw, 'x', nh);
         }
         return finalCanvas;
     }

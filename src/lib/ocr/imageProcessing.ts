@@ -105,36 +105,70 @@ export function getCroppedCanvas(source: HTMLImageElement | HTMLCanvasElement, c
     let scaleX = 1;
     let scaleY = 1;
 
-    // ReactCropから渡されるcropはブラウザ上の表示サイズに基づくため、元の解像度へのスケーリングが必要
-    if (source instanceof HTMLImageElement) {
-        scaleX = source.naturalWidth / source.width;
-        scaleY = source.naturalHeight / source.height;
+    // sourceのサイズ（フォールバック付き）
+    const natW = source instanceof HTMLImageElement ? (source.naturalWidth || source.width) : source.width;
+    const natH = source instanceof HTMLImageElement ? (source.naturalHeight || source.height) : source.height;
+
+    const isPercent = (crop as any).unit === '%';
+
+    if (source instanceof HTMLImageElement && !isPercent) {
+        // 表示幅が0などで割れないように保護
+        if (source.width > 0) scaleX = source.naturalWidth / source.width;
+        if (source.height > 0) scaleY = source.naturalHeight / source.height;
     }
 
-    const scaledWidth = Math.floor(crop.width * scaleX);
-    const scaledHeight = Math.floor(crop.height * scaleY);
+    let sx = 0, sy = 0, sw = 0, sh = 0;
 
-    if (scaledWidth <= 0 || scaledHeight <= 0) {
+    if (isPercent) {
+        sx = (crop.x / 100) * natW;
+        sy = (crop.y / 100) * natH;
+        sw = (crop.width / 100) * natW;
+        sh = (crop.height / 100) * natH;
+    } else {
+        sx = crop.x * scaleX;
+        sy = crop.y * scaleY;
+        sw = crop.width * scaleX;
+        sh = crop.height * scaleY;
+    }
+
+    const scaledWidth = Math.floor(sw);
+    const scaledHeight = Math.floor(sh);
+
+    console.log('\n[DEBUG] getCroppedCanvas Params:', {
+        cropParams: crop,
+        isPercent,
+        scaleX, 
+        scaleY,
+        natW, natH,
+        sourceWidth: source.width,
+        sourceHeight: source.height,
+        sx, sy, sw, sh,
+        scaledWidth, scaledHeight
+    });
+
+    if (scaledWidth <= 0 || scaledHeight <= 0 || isNaN(scaledWidth) || isNaN(scaledHeight)) {
+        console.warn("[DEBUG] Scaled size is 0 or NaN. Returning original full image.");
         if (source instanceof HTMLCanvasElement) return source;
         const fallback = document.createElement('canvas');
-        fallback.width = source.naturalWidth || source.width;
-        fallback.height = source.naturalHeight || source.height;
+        fallback.width = natW;
+        fallback.height = natH;
         fallback.getContext('2d')?.drawImage(source, 0, 0);
         return fallback;
     }
 
     canvas.width = scaledWidth;
     canvas.height = scaledHeight;
+    console.log('[DEBUG] Target Canvas Size:', canvas.width, 'x', canvas.height);
     
     const ctx = canvas.getContext('2d');
     if (!ctx) return source instanceof HTMLCanvasElement ? source : canvas;
 
     ctx.drawImage(
         source,
-        crop.x * scaleX,
-        crop.y * scaleY,
-        crop.width * scaleX,
-        crop.height * scaleY,
+        sx,
+        sy,
+        sw,
+        sh,
         0,
         0,
         scaledWidth,
