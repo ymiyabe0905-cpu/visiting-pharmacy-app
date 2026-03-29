@@ -32,19 +32,43 @@ export async function GET(request: Request) {
             query += ` and ${KINTONE_FIELDS.PATIENT_NAME} like "${patientName}"`;
         }
 
-        // 今後14日以内の日付条件（本日～14日後）
-        const today = new Date();
-        const futureDate = new Date();
-        futureDate.setDate(today.getDate() + 14);
+        // クエリに使うベース日付（交付日）のフォーマット (YYYY-MM-DD)
+        let baseDateStr = "";
+        let baseDateObj = new Date(); // フォールバックは本日
 
-        // YYYY-MM-DD
-        const todayStr = today.toISOString().split('T')[0];
-        const futureStr = futureDate.toISOString().split('T')[0];
+        if (visitDateRaw) {
+            // "2026/03/18" などを "2026-03-18" に変換（URLパラメータからだと / が含まれるか Date inputによって - かゆれるため）
+            let safeDateStr = visitDateRaw.replace(/\//g, '-');
+            const parsed = new Date(safeDateStr);
+            if (!isNaN(parsed.getTime())) {
+                baseDateObj = parsed;
+            }
+        }
+        
+        // JST基準で YYYY-MM-DD を抽出
+        const getOffsetDateStr = (date: Date, offsetDays: number) => {
+            const d = new Date(date.getTime());
+            d.setDate(d.getDate() + offsetDays);
+            // 日本時間などでローカルの年月日を取るため
+            const y = d.getFullYear();
+            const m = String(d.getMonth() + 1).padStart(2, '0');
+            const day = String(d.getDate()).padStart(2, '0');
+            return `${y}-${m}-${day}`;
+        };
 
-        query += ` and ${KINTONE_FIELDS.VISIT_DATE} >= "${todayStr}" and ${KINTONE_FIELDS.VISIT_DATE} <= "${futureStr}"`;
+        baseDateStr = getOffsetDateStr(baseDateObj, 0);
+        const futureStr = getOffsetDateStr(baseDateObj, 14);
+
+        query += ` and ${KINTONE_FIELDS.VISIT_DATE} >= "${baseDateStr}" and ${KINTONE_FIELDS.VISIT_DATE} <= "${futureStr}"`;
+
+        console.log('\n=== Kintone Search Debug ===');
+        console.log('Patient Name:', patientName);
+        console.log('Visit Date (Formatted):', baseDateStr);
+        console.log('Query String:', query);
+        console.log('Visit Date Field Code:', KINTONE_FIELDS.VISIT_DATE);
+        console.log('============================\n');
 
         // 取得
-        console.log('Primary Query:', query);
         let kintoneResp = await getKintoneRecords(query);
         let records: KintoneRecord[] = kintoneResp.records || [];
         let isRescueSearch = false;
@@ -52,7 +76,7 @@ export async function GET(request: Request) {
         // 救済検索 (0件の場合、患者名の like 条件を外して、日付範囲のみで全取得してスコアリングにかける。※レコード数が多い場合は注意が必要)
         if (records.length === 0) {
             isRescueSearch = true;
-            const rescueQuery = `${statusQuery} and ${KINTONE_FIELDS.VISIT_DATE} >= "${todayStr}" and ${KINTONE_FIELDS.VISIT_DATE} <= "${futureStr}"`;
+            const rescueQuery = `${statusQuery} and ${KINTONE_FIELDS.VISIT_DATE} >= "${baseDateStr}" and ${KINTONE_FIELDS.VISIT_DATE} <= "${futureStr}"`;
             console.log('Rescue Query:', rescueQuery);
             kintoneResp = await getKintoneRecords(rescueQuery);
             records = kintoneResp.records || [];

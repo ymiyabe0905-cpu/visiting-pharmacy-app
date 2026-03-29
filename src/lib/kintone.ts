@@ -140,6 +140,8 @@ export const getKintoneHeaders = () => {
  * kintoneのレコード検索関数 (共通)
  */
 export async function getKintoneRecords(query: string) {
+    console.log("query", query);
+
     if (USE_MOCK_DATA) {
         console.log('[MOCK] getKintoneRecords called with query:', query);
         // モックの遅延をシミュレート
