@@ -6,7 +6,7 @@ import Tesseract from "tesseract.js";
 import ReactCrop, { Crop, PixelCrop } from 'react-image-crop';
 import 'react-image-crop/dist/ReactCrop.css';
 import { extractRecord } from "@/lib/ocr/extractor";
-import { autoRotateImage, preprocessCanvas, getCroppedCanvas, canvasToDataUrl } from "@/lib/ocr/imageProcessing";
+import { autoRotateImage, preprocessCanvas, getCroppedCanvas, canvasToDataUrl, PreprocessMode } from "@/lib/ocr/imageProcessing";
 
 type OcrStatus = "idle" | "loading" | "success" | "error";
 
@@ -32,14 +32,16 @@ export default function ScanPage() {
     const [showRawOcrText, setShowRawOcrText] = useState(false);
 
     // 画像処理・トリミング用ステート
-    const [cropSrc, setCropSrc] = useState(""); // 回転・前処理後のクロップ用画像
-    const [originalImageForRotation, setOriginalImageForRotation] = useState<HTMLImageElement | null>(null);
+    const [cropSrc, setCropSrc] = useState(""); // UI表示用のDataURL
+    const [rawImage, setRawImage] = useState<HTMLImageElement | null>(null); // 自動補正直後の純粋画像
+    const [preprocessMode, setPreprocessMode] = useState<PreprocessMode>('grayscale');
     const [rotationCorrection, setRotationCorrection] = useState<number>(0);
+    const [skewAngle, setSkewAngle] = useState<number>(0); // 1度単位の微細傾き補正用
     const [crop, setCrop] = useState<Crop>();
     const [completedCrop, setCompletedCrop] = useState<PixelCrop>();
     const [isCropping, setIsCropping] = useState(false);
-    const [skewAngle, setSkewAngle] = useState<number>(0); // 1度単位の微細傾き補正用
     const imgRef = useRef<HTMLImageElement>(null);
+    const [advancedDebugInfo, setAdvancedDebugInfo] = useState<any>(null);
 
     // 画像が不要になった時点でメモリから速やかに破棄するための関数
     const cleanupImage = () => {
@@ -80,21 +82,14 @@ export default function ScanPage() {
             // OSD等を利用して自動傾き補正
             const rotatedCanvas = await autoRotateImage(dataUrl);
             
-            // User requirement: "自動回転 → 前処理 → トリミング"
-            // 前処理（白黒2値化・コントラスト）をこの時点でかける
-            const preprocessedCanvas = preprocessCanvas(rotatedCanvas);
-            
-            const processedDataUrl = canvasToDataUrl(preprocessedCanvas);
-            setCropSrc(processedDataUrl);
-            
-            // 手動回転用のオリジナル状態保持
+            // 手動回転用の純粋な画像を保持 (プレビュー用描画は useEffect に委譲)
             const img = new Image();
             img.onload = () => {
-                setOriginalImageForRotation(img);
+                setRawImage(img);
                 setRotationCorrection(0);
                 setSkewAngle(0);
             };
-            img.src = processedDataUrl;
+            img.src = canvasToDataUrl(rotatedCanvas);
             
             setStatus("idle");
         } catch (err) {
@@ -105,33 +100,42 @@ export default function ScanPage() {
     };
 
     /**
-     * 回転・傾き適用時に再描画するEffect
+     * 回転・傾き・前処理を適用したCanvasを生成するヘルパー
      */
-    useEffect(() => {
-        if (!originalImageForRotation) return;
-
+    const generateProcessedCanvas = (imgData: HTMLImageElement, mode: PreprocessMode, rt: number, sk: number): HTMLCanvasElement | null => {
         const canvas = document.createElement('canvas');
         const ctx = canvas.getContext('2d');
-        if (!ctx) return;
+        if (!ctx) return null;
 
-        const totalRotation = rotationCorrection + skewAngle;
+        const totalRotation = rt + sk;
         const rad = (totalRotation * Math.PI) / 180;
         
         // 回転後のバウンディングボックスサイズを計算（余白が切れないように）
         const absCos = Math.abs(Math.cos(rad));
         const absSin = Math.abs(Math.sin(rad));
-        const newWidth = originalImageForRotation.width * absCos + originalImageForRotation.height * absSin;
-        const newHeight = originalImageForRotation.width * absSin + originalImageForRotation.height * absCos;
+        const newWidth = imgData.width * absCos + imgData.height * absSin;
+        const newHeight = imgData.width * absSin + imgData.height * absCos;
 
         canvas.width = newWidth;
         canvas.height = newHeight;
 
         ctx.translate(canvas.width / 2, canvas.height / 2);
         ctx.rotate(rad);
-        ctx.drawImage(originalImageForRotation, -originalImageForRotation.width / 2, -originalImageForRotation.height / 2);
+        ctx.drawImage(imgData, -imgData.width / 2, -imgData.height / 2);
 
-        setCropSrc(canvasToDataUrl(canvas));
-    }, [rotationCorrection, skewAngle, originalImageForRotation]);
+        return preprocessCanvas(canvas, mode);
+    };
+
+    /**
+     * 回転・傾き適用時に再描画するEffect
+     */
+    useEffect(() => {
+        if (!rawImage) return;
+        const processed = generateProcessedCanvas(rawImage, preprocessMode, rotationCorrection, skewAngle);
+        if (processed) {
+            setCropSrc(canvasToDataUrl(processed));
+        }
+    }, [rotationCorrection, skewAngle, preprocessMode, rawImage]);
 
     /**
      * 手動90度回転
@@ -148,15 +152,43 @@ export default function ScanPage() {
     };
 
     /**
+     * 全文OCRテスト (切り分け用)
+     */
+    const handleFullOcrTest = async () => {
+        if (!imgRef.current) return;
+        setStatus("loading");
+        
+        let testCanvas: HTMLCanvasElement;
+        if (completedCrop && completedCrop.width > 0 && completedCrop.height > 0) {
+            testCanvas = getCroppedCanvas(imgRef.current, completedCrop);
+        } else {
+            testCanvas = document.createElement('canvas');
+            testCanvas.width = imgRef.current.width;
+            testCanvas.height = imgRef.current.height;
+            const ctx = testCanvas.getContext('2d');
+            ctx?.drawImage(imgRef.current, 0, 0);
+        }
+        
+        try {
+            const result = await Tesseract.recognize(canvasToDataUrl(testCanvas), 'jpn');
+            setStatus("idle");
+            alert(`【全文OCRテスト結果】\n（これでも読めない場合は前処理・画質の問題です）\n\n${result.data.text}`);
+        } catch (e: any) {
+            setStatus("idle");
+            alert("全文OCRテスト中にエラーが発生しました: " + e.message);
+        }
+    };
+
+    /**
      * トリミング完了後の処理
      */
     const handleCropComplete = async () => {
         if (!imgRef.current) return;
         setIsCropping(false);
         setStatus("loading");
+        setAdvancedDebugInfo(null);
         
         // 切り抜き
-        // ※ すでに前処理は完了しているので切り抜くだけ
         let finalCanvas: HTMLCanvasElement;
         
         if (completedCrop && completedCrop.width > 0 && completedCrop.height > 0) {
@@ -194,21 +226,26 @@ export default function ScanPage() {
                 return rc;
             };
 
-            // 1. 患者名領域 (左上: x:0~65%, y:0~35%)
-            const nameCanvas = createRegionCanvas(0, 0, w * 0.65, h * 0.35);
-            // 2. 生年月日領域 (左中上: x:0~65%, y:20~55%)
-            const birthCanvas = createRegionCanvas(0, h * 0.20, w * 0.65, h * 0.35);
-            // 3. 医療機関名領域 (右上: x:45~100%, y:0~45%)
-            const clinicCanvas = createRegionCanvas(w * 0.45, 0, w * 0.55, h * 0.45);
-            // 4. 交付年月日領域 (左中: x:0~65%, y:35~75%)
-            const visitDateCanvas = createRegionCanvas(0, h * 0.35, w * 0.65, h * 0.40);
+            // 1. 患者名領域 (左上: x:0~75%, y:0~40%)
+            const nameCanvas = createRegionCanvas(0, 0, w * 0.75, h * 0.40);
+            // 2. 生年月日領域 (左中上: x:0~75%, y:15~60%)
+            const birthCanvas = createRegionCanvas(0, h * 0.15, w * 0.75, h * 0.45);
+            // 3. 医療機関名領域 (右上: x:35~100%, y:0~55%)
+            const clinicCanvas = createRegionCanvas(w * 0.35, 0, w * 0.65, h * 0.55);
+            // 4. 交付年月日領域 (左中: x:0~75%, y:25~85%)
+            const visitDateCanvas = createRegionCanvas(0, h * 0.25, w * 0.75, h * 0.60);
 
             // 並行タスクで部分OCRを実行
+            const nameUrl = canvasToDataUrl(nameCanvas);
+            const birthUrl = canvasToDataUrl(birthCanvas);
+            const clinicUrl = canvasToDataUrl(clinicCanvas);
+            const visitDateUrl = canvasToDataUrl(visitDateCanvas);
+
             const [nameRes, birthRes, clinicRes, visitDateRes] = await Promise.all([
-                Tesseract.recognize(canvasToDataUrl(nameCanvas), 'jpn'),
-                Tesseract.recognize(canvasToDataUrl(birthCanvas), 'jpn'),
-                Tesseract.recognize(canvasToDataUrl(clinicCanvas), 'jpn'),
-                Tesseract.recognize(canvasToDataUrl(visitDateCanvas), 'jpn')
+                Tesseract.recognize(nameUrl, 'jpn'),
+                Tesseract.recognize(birthUrl, 'jpn'),
+                Tesseract.recognize(clinicUrl, 'jpn'),
+                Tesseract.recognize(visitDateUrl, 'jpn')
             ]);
             
             const nameText = nameRes.data.text;
@@ -226,6 +263,11 @@ export default function ScanPage() {
             let pBirth = extractedBirthStr.birthDate;
             let pClinic = extractedClinicStr.clinicName;
             let pVisit = extractedVisitDateStr.visitDate;
+
+            // date input のために形式をチェック
+            if (pVisit && !/^\d{4}-\d{2}-\d{2}$/.test(pVisit)) {
+                pVisit = "";
+            }
             
             let finalRawText = `[Name Region]\n${nameText}\n\n[Birth Region]\n${birthText}\n\n[Clinic Region]\n${clinicText}\n\n[VisitDate Region]\n${visitDateText}`;
             let finalCorrectedText = `[Name]\n${extractedNameStr.correctedText}\n[Birth]\n${extractedBirthStr.correctedText}\n[Clinic]\n${extractedClinicStr.correctedText}\n[VisitDate]\n${extractedVisitDateStr.correctedText}`;
@@ -237,17 +279,47 @@ export default function ScanPage() {
             };
 
             // 全文OCRへのフォールバック（部分OCRで不足している場合のみ）
-            // 全ての項目が必須ではないかもしれないが、精度のために空欄が１つでもあれば補助的にフルスキャンする
+            let fallbackFullText = "";
             if (!pName || !pBirth || !pVisit || !pClinic) {
                 console.log("不足項目あり。全文OCRで補助実装を実行します...");
-                const fullDataUrl = canvasToDataUrl(croppedCanvas);
+                let fallbackCanvas = croppedCanvas;
+                
+                // 前処理が強すぎた可能性がある場合は、元のグレースケールで作り直して再検証する
+                if (preprocessMode === 'binarize' && rawImage) {
+                    const fallbackProcessed = generateProcessedCanvas(rawImage, 'grayscale', rotationCorrection, skewAngle);
+                    if (fallbackProcessed) {
+                        if (completedCrop && completedCrop.width > 0 && completedCrop.height > 0) {
+                            fallbackCanvas = getCroppedCanvas(fallbackProcessed, completedCrop);
+                        } else {
+                            fallbackCanvas = fallbackProcessed;
+                        }
+                    }
+                }
+
+                const fullDataUrl = canvasToDataUrl(fallbackCanvas);
                 const fullResult = await Tesseract.recognize(fullDataUrl, 'jpn');
                 const fullText = fullResult.data.text;
+                fallbackFullText = fullText;
                 
                 // 文字が極端に少ない場合は手打ち画面へ
                 if (fullText.trim().length < 5) {
                     setStatus("error");
                     setErrorMessage("画質が不十分で読み取れません。手入力で検索を開始してください。");
+                    
+                    if (process.env.NODE_ENV === 'development') {
+                        setAdvancedDebugInfo({
+                            originalUrl: rawImage?.src,
+                            preprocessedUrl: cropSrc,
+                            croppedUrl: canvasToDataUrl(croppedCanvas),
+                            regions: {
+                                name: { url: nameUrl, text: nameText },
+                                birth: { url: birthUrl, text: birthText },
+                                clinic: { url: clinicUrl, text: clinicText },
+                                visit: { url: visitDateUrl, text: visitDateText },
+                            },
+                            fallbackText: fallbackFullText
+                        });
+                    }
                     return;
                 }
 
@@ -256,8 +328,11 @@ export default function ScanPage() {
                 // 空のものだけ全文OCR結果で埋め直す
                 if (!pName) pName = extractedFull.patientName;
                 if (!pBirth) pBirth = extractedFull.birthDate;
-                if (!pVisit) pVisit = extractedFull.visitDate;
                 if (!pClinic) pClinic = extractedFull.clinicName;
+                if (!pVisit) {
+                    pVisit = extractedFull.visitDate;
+                    if (pVisit && !/^\d{4}-\d{2}-\d{2}$/.test(pVisit)) pVisit = "";
+                }
                 
                 finalRawText += `\n\n[Full Region Fallback]\n${fullText}`;
                 finalCorrectedText += "\n\n[Full]\n" + extractedFull.correctedText;
@@ -270,6 +345,18 @@ export default function ScanPage() {
             setRawOcrText(finalRawText);
             setCorrectedOcrText(finalCorrectedText);
             setDebugInfo(finalDebugInfo);
+            setAdvancedDebugInfo({
+                originalUrl: rawImage?.src,
+                preprocessedUrl: cropSrc,
+                croppedUrl: canvasToDataUrl(croppedCanvas),
+                regions: {
+                    name: { url: nameUrl, text: nameText },
+                    birth: { url: birthUrl, text: birthText },
+                    clinic: { url: clinicUrl, text: clinicText },
+                    visit: { url: visitDateUrl, text: visitDateText },
+                },
+                fallbackText: fallbackFullText
+            });
 
             // 患者名と交付日のいずれかが空行の場合は警告を出し、プレビューを自動で開く
             if (!pName || !pVisit) {
@@ -353,27 +440,43 @@ export default function ScanPage() {
                     <div style={{ padding: '16px', backgroundColor: '#fef3c7', color: '#92400e', borderRadius: '8px', marginBottom: '16px' }}>
                         <strong>付箋や別紙が大きく写り込んでいる場合は除外してください。</strong>文字がまっすぐになるよう必要に応じて右回転やスライダーで微調整し、処方箋の本文領域だけを囲んでください。
                     </div>
-                    <div style={{ marginBottom: '16px', display: 'flex', flexWrap: 'wrap', gap: '16px', alignItems: 'center' }}>
-                        <button 
-                            type="button"
-                            onClick={handleManualRotate}
-                            style={{ padding: '8px 16px', backgroundColor: '#ffffff', color: '#1e293b', border: '1px solid #cbd5e1', borderRadius: '4px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '8px' }}
-                        >
-                            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
-                            右に90度回転
-                        </button>
-
-                        <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: '1 1 auto', minWidth: '200px', backgroundColor: '#f8fafc', padding: '8px 16px', borderRadius: '4px', border: '1px solid #e2e8f0' }}>
-                            <span style={{ fontSize: '0.9rem', color: '#475569', whiteSpace: 'nowrap' }}>微調整: {skewAngle}°</span>
-                            <input 
-                                type="range" 
-                                min="-15" 
-                                max="15" 
-                                step="1" 
-                                value={skewAngle} 
-                                onChange={handleSkewChange}
-                                style={{ flex: 1, cursor: 'pointer' }}
-                            />
+                    <div style={{ marginBottom: '16px', display: 'flex', flexWrap: 'wrap', gap: '16px', alignItems: 'center', justifyContent: 'space-between' }}>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', padding: '8px', backgroundColor: '#f1f5f9', borderRadius: '4px' }}>
+                            <span style={{ fontSize: '0.85rem', fontWeight: 600, color: '#475569' }}>画質調整:</span>
+                            <label style={{ fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                                <input type="radio" value="grayscale" checked={preprocessMode === 'grayscale'} onChange={() => setPreprocessMode('grayscale')} />
+                                白黒のみ
+                            </label>
+                            <label style={{ fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                                <input type="radio" value="none" checked={preprocessMode === 'none'} onChange={() => setPreprocessMode('none')} />
+                                元画像
+                            </label>
+                            <label style={{ fontSize: '0.85rem', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer' }}>
+                                <input type="radio" value="binarize" checked={preprocessMode === 'binarize'} onChange={() => setPreprocessMode('binarize')} />
+                                コントラスト強
+                            </label>
+                        </div>
+                        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+                            <button 
+                                type="button"
+                                onClick={handleManualRotate}
+                                style={{ padding: '8px 16px', backgroundColor: '#ffffff', color: '#1e293b', border: '1px solid #cbd5e1', borderRadius: '4px', cursor: 'pointer', display: 'inline-flex', alignItems: 'center', gap: '8px' }}
+                            >
+                                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><polyline points="23 4 23 10 17 10"></polyline><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"></path></svg>
+                                右に90度回転
+                            </button>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', flex: '1 1 auto', minWidth: '150px', backgroundColor: '#f8fafc', padding: '8px 16px', borderRadius: '4px', border: '1px solid #e2e8f0' }}>
+                                <span style={{ fontSize: '0.9rem', color: '#475569', whiteSpace: 'nowrap' }}>微調整: {skewAngle}°</span>
+                                <input 
+                                    type="range" 
+                                    min="-15" 
+                                    max="15" 
+                                    step="1" 
+                                    value={skewAngle} 
+                                    onChange={handleSkewChange}
+                                    style={{ flex: 1, cursor: 'pointer' }}
+                                />
+                            </div>
                         </div>
                     </div>
                     <ReactCrop 
@@ -394,11 +497,10 @@ export default function ScanPage() {
                         </button>
                         <button 
                             type="button"
-                            onClick={handleRetake}
-                            className="btn-secondary"
-                            style={{ flex: 1 }}
+                            onClick={handleFullOcrTest}
+                            style={{ padding: '8px', backgroundColor: '#f3f4f6', color: '#374151', border: '1px solid #d1d5db', borderRadius: '4px', cursor: 'pointer', fontSize: '0.9rem' }}
                         >
-                            キャンセル
+                            全文OCRテスト
                         </button>
                     </div>
                 </div>
@@ -484,10 +586,11 @@ export default function ScanPage() {
                             <label htmlFor="visitDate" style={{ fontWeight: 600 }}>交付日</label>
                             <input
                                 id="visitDate"
-                                type="text"
+                                type="date"
                                 value={visitDate}
                                 onChange={e => setVisitDate(e.target.value)}
-                                style={{ padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)', fontSize: '1rem' }}
+                                style={{ padding: '12px', borderRadius: '8px', border: '1px solid var(--border-color)', fontSize: '1.05rem', backgroundColor: '#fff', color: '#1e293b' }}
+                                required
                             />
                         </div>
 
@@ -553,6 +656,65 @@ export default function ScanPage() {
                                     )}
                                 </div>
                             )}
+                        </div>
+                    )}
+                    {process.env.NODE_ENV === 'development' && advancedDebugInfo && (
+                        <div style={{ marginTop: '32px', padding: '16px', backgroundColor: '#fff1f2', borderRadius: '8px', border: '1px solid #fecdd3' }}>
+                            <h3 style={{ fontSize: '1rem', color: '#be123c', marginBottom: '16px', borderBottom: '1px solid #fda4af', paddingBottom: '8px' }}>
+                                🕵️‍♀️ 画像処理・OCR 詳細デバッグ情報
+                            </h3>
+                            
+                            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)', gap: '16px', marginBottom: '24px' }}>
+                                <div>
+                                    <div style={{ fontSize: '0.8rem', fontWeight: 'bold' }}>1. 元画像(自動回転後)</div>
+                                    <img src={advancedDebugInfo.originalUrl} style={{ width: '100%', height: 'auto', border: '1px solid #ccc' }} />
+                                </div>
+                                <div>
+                                    <div style={{ fontSize: '0.8rem', fontWeight: 'bold' }}>2. 前処理後(表示用)</div>
+                                    <img src={advancedDebugInfo.preprocessedUrl} style={{ width: '100%', height: 'auto', border: '1px solid #ccc' }} />
+                                </div>
+                                <div>
+                                    <div style={{ fontSize: '0.8rem', fontWeight: 'bold' }}>3. トリミング後</div>
+                                    <img src={advancedDebugInfo.croppedUrl} style={{ width: '100%', height: 'auto', border: '1px solid #ccc' }} />
+                                </div>
+                            </div>
+
+                            <h4 style={{ fontSize: '0.9rem', marginBottom: '8px' }}>4. 部分OCR 領域分割 と 生テキスト</h4>
+                            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: '16px', marginBottom: '16px' }}>
+                                <div style={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', padding: '8px', borderRadius: '4px' }}>
+                                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>患者名 領域</div>
+                                    <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                                        <div style={{ flex: '1', minWidth: '0' }}><img src={advancedDebugInfo.regions.name.url} style={{ width: '100%', border: '1px dashed #ccc' }} /></div>
+                                        <div style={{ flex: '1', minWidth: '0', fontSize: '0.75rem', overflow: 'auto', maxHeight: '100px', backgroundColor: '#f8fafc', padding: '4px', fontFamily: 'monospace' }}>{advancedDebugInfo.regions.name.text || '(空)'}</div>
+                                    </div>
+                                </div>
+                                <div style={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', padding: '8px', borderRadius: '4px' }}>
+                                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>生年月日 領域</div>
+                                    <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                                        <div style={{ flex: '1', minWidth: '0' }}><img src={advancedDebugInfo.regions.birth.url} style={{ width: '100%', border: '1px dashed #ccc' }} /></div>
+                                        <div style={{ flex: '1', minWidth: '0', fontSize: '0.75rem', overflow: 'auto', maxHeight: '100px', backgroundColor: '#f8fafc', padding: '4px', fontFamily: 'monospace' }}>{advancedDebugInfo.regions.birth.text || '(空)'}</div>
+                                    </div>
+                                </div>
+                                <div style={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', padding: '8px', borderRadius: '4px' }}>
+                                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>医療機関名 領域</div>
+                                    <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                                        <div style={{ flex: '1', minWidth: '0' }}><img src={advancedDebugInfo.regions.clinic.url} style={{ width: '100%', border: '1px dashed #ccc' }} /></div>
+                                        <div style={{ flex: '1', minWidth: '0', fontSize: '0.75rem', overflow: 'auto', maxHeight: '100px', backgroundColor: '#f8fafc', padding: '4px', fontFamily: 'monospace' }}>{advancedDebugInfo.regions.clinic.text || '(空)'}</div>
+                                    </div>
+                                </div>
+                                <div style={{ backgroundColor: '#fff', border: '1px solid #e2e8f0', padding: '8px', borderRadius: '4px' }}>
+                                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>交付年月日 領域</div>
+                                    <div style={{ display: 'flex', gap: '8px', marginTop: '4px' }}>
+                                        <div style={{ flex: '1', minWidth: '0' }}><img src={advancedDebugInfo.regions.visit.url} style={{ width: '100%', border: '1px dashed #ccc' }} /></div>
+                                        <div style={{ flex: '1', minWidth: '0', fontSize: '0.75rem', overflow: 'auto', maxHeight: '100px', backgroundColor: '#f8fafc', padding: '4px', fontFamily: 'monospace' }}>{advancedDebugInfo.regions.visit.text || '(空)'}</div>
+                                    </div>
+                                </div>
+                            </div>
+                            
+                            <h4 style={{ fontSize: '0.9rem', marginBottom: '8px' }}>5. 全文OCRフォールバック 結果</h4>
+                            <div style={{ padding: '8px', backgroundColor: '#fff', fontSize: '0.8rem', fontFamily: 'monospace', whiteSpace: 'pre-wrap', maxHeight: '150px', overflowY: 'auto', border: '1px solid #e2e8f0', borderRadius: '4px' }}>
+                                {advancedDebugInfo.fallbackText ? advancedDebugInfo.fallbackText : '(フォールバック未実行)'}
+                            </div>
                         </div>
                     )}
                 </div>

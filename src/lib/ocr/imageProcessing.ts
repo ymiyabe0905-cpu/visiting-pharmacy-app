@@ -56,11 +56,15 @@ export async function autoRotateImage(imageUrl: string): Promise<HTMLCanvasEleme
     return canvas;
 }
 
+export type PreprocessMode = 'none' | 'grayscale' | 'binarize';
+
 /**
- * 画像をグレースケール化・2値化してコントラストを強調する。
+ * 画像を前処理する（モード切替対応）。
  * 背景の影を飛ばし、文字をくっきりさせる。
  */
-export function preprocessCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
+export function preprocessCanvas(canvas: HTMLCanvasElement, mode: PreprocessMode = 'grayscale'): HTMLCanvasElement {
+    if (mode === 'none') return canvas;
+
     const ctx = canvas.getContext('2d');
     if (!ctx) return canvas;
 
@@ -77,14 +81,15 @@ export function preprocessCanvas(canvas: HTMLCanvasElement): HTMLCanvasElement {
         const b = data[i + 2];
         let gray = 0.299 * r + 0.587 * g + 0.114 * b;
         
-        // コントラストを強調し、背景の影をより白く、文字をより黒く近づける
-        gray = ((gray - 128) * contrast) + 128;
+        if (mode === 'binarize') {
+            // コントラストを強調し、背景の影をより白く、文字をより黒く近づける
+            gray = ((gray - 128) * contrast) + 128;
+            gray = gray > threshold ? 255 : 0;
+        }
         
-        const val = gray > threshold ? 255 : 0;
-        
-        data[i] = val;     // R
-        data[i + 1] = val; // G
-        data[i + 2] = val; // B
+        data[i] = gray;     // R
+        data[i + 1] = gray; // G
+        data[i + 2] = gray; // B
         // Alpha (data[i+3]) is kept
     }
 
