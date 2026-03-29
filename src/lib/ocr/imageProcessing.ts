@@ -102,22 +102,43 @@ export function preprocessCanvas(canvas: HTMLCanvasElement, mode: PreprocessMode
  */
 export function getCroppedCanvas(source: HTMLImageElement | HTMLCanvasElement, crop: PixelCrop): HTMLCanvasElement {
     const canvas = document.createElement('canvas');
-    canvas.width = crop.width;
-    canvas.height = crop.height;
+    let scaleX = 1;
+    let scaleY = 1;
+
+    // ReactCropから渡されるcropはブラウザ上の表示サイズに基づくため、元の解像度へのスケーリングが必要
+    if (source instanceof HTMLImageElement) {
+        scaleX = source.naturalWidth / source.width;
+        scaleY = source.naturalHeight / source.height;
+    }
+
+    const scaledWidth = Math.floor(crop.width * scaleX);
+    const scaledHeight = Math.floor(crop.height * scaleY);
+
+    if (scaledWidth <= 0 || scaledHeight <= 0) {
+        if (source instanceof HTMLCanvasElement) return source;
+        const fallback = document.createElement('canvas');
+        fallback.width = source.naturalWidth || source.width;
+        fallback.height = source.naturalHeight || source.height;
+        fallback.getContext('2d')?.drawImage(source, 0, 0);
+        return fallback;
+    }
+
+    canvas.width = scaledWidth;
+    canvas.height = scaledHeight;
     
     const ctx = canvas.getContext('2d');
     if (!ctx) return source instanceof HTMLCanvasElement ? source : canvas;
 
     ctx.drawImage(
         source,
-        crop.x,
-        crop.y,
-        crop.width,
-        crop.height,
+        crop.x * scaleX,
+        crop.y * scaleY,
+        crop.width * scaleX,
+        crop.height * scaleY,
         0,
         0,
-        crop.width,
-        crop.height
+        scaledWidth,
+        scaledHeight
     );
 
     return canvas;

@@ -10,6 +10,15 @@ import { autoRotateImage, preprocessCanvas, getCroppedCanvas, canvasToDataUrl, P
 
 type OcrStatus = "idle" | "loading" | "success" | "error";
 
+// 部分OCRで画像領域を何%〜何%の範囲で切り出すかの定数設定
+// 万が一ズレる場合はここの w (幅) と h (高さ) を広げてください
+const OCR_REGIONS = {
+    name:      { x: 0,    y: 0,    w: 0.75, h: 0.40 }, // 左上 (幅75%, 高さ40%)
+    birth:     { x: 0,    y: 0.15, w: 0.75, h: 0.45 }, // 左中上 (幅75%, 高さ45%)
+    clinic:    { x: 0.35, y: 0,    w: 0.65, h: 0.55 }, // 右上 (幅65%, 高さ55%)
+    visitDate: { x: 0,    y: 0.25, w: 0.75, h: 0.60 }  // 左中 (幅75%, 高さ60%)
+};
+
 export default function ScanPage() {
     const router = useRouter();
     const fileInputRef = useRef<HTMLInputElement>(null);
@@ -40,6 +49,7 @@ export default function ScanPage() {
     const [crop, setCrop] = useState<Crop>();
     const [completedCrop, setCompletedCrop] = useState<PixelCrop>();
     const [isCropping, setIsCropping] = useState(false);
+    const [disableCropping, setDisableCropping] = useState(false); // トリミング無効テストモード用
     const imgRef = useRef<HTMLImageElement>(null);
     const [advancedDebugInfo, setAdvancedDebugInfo] = useState<any>(null);
 
@@ -152,22 +162,33 @@ export default function ScanPage() {
     };
 
     /**
+     * トリミング適用または画像全体を返すヘルパー
+     */
+    const buildFinalCanvas = (): HTMLCanvasElement | null => {
+        if (!imgRef.current) return null;
+        let finalCanvas: HTMLCanvasElement;
+        
+        if (!disableCropping && completedCrop && completedCrop.width > 0 && completedCrop.height > 0) {
+            finalCanvas = getCroppedCanvas(imgRef.current, completedCrop);
+        } else {
+            // トリミング無効、または枠が指定されなかった場合は画像全体を高解像度で使用
+            finalCanvas = document.createElement('canvas');
+            finalCanvas.width = imgRef.current.naturalWidth || imgRef.current.width;
+            finalCanvas.height = imgRef.current.naturalHeight || imgRef.current.height;
+            const ctx = finalCanvas.getContext('2d');
+            ctx?.drawImage(imgRef.current, 0, 0, finalCanvas.width, finalCanvas.height);
+        }
+        return finalCanvas;
+    }
+
+    /**
      * 全文OCRテスト (切り分け用)
      */
     const handleFullOcrTest = async () => {
-        if (!imgRef.current) return;
+        const testCanvas = buildFinalCanvas();
+        if (!testCanvas) return;
+
         setStatus("loading");
-        
-        let testCanvas: HTMLCanvasElement;
-        if (completedCrop && completedCrop.width > 0 && completedCrop.height > 0) {
-            testCanvas = getCroppedCanvas(imgRef.current, completedCrop);
-        } else {
-            testCanvas = document.createElement('canvas');
-            testCanvas.width = imgRef.current.width;
-            testCanvas.height = imgRef.current.height;
-            const ctx = testCanvas.getContext('2d');
-            ctx?.drawImage(imgRef.current, 0, 0);
-        }
         
         try {
             const result = await Tesseract.recognize(canvasToDataUrl(testCanvas), 'jpn');
@@ -183,29 +204,24 @@ export default function ScanPage() {
      * トリミング完了後の処理
      */
     const handleCropComplete = async () => {
-        if (!imgRef.current) return;
+        const finalCanvas = buildFinalCanvas();
+        if (!finalCanvas || !imgRef.current) return;
+
+        const partialDebugInfo = {
+            originalSize: { w: imgRef.current.naturalWidth, h: imgRef.current.naturalHeight },
+            displaySize: { w: imgRef.current.width, h: imgRef.current.height },
+            croppedSize: { w: finalCanvas.width, h: finalCanvas.height },
+            isCroppingDisabled: disableCropping
+        };
+
         setIsCropping(false);
         setStatus("loading");
-        setAdvancedDebugInfo(null);
+        setAdvancedDebugInfo(partialDebugInfo); // 一旦セット
         
-        // 切り抜き
-        let finalCanvas: HTMLCanvasElement;
-        
-        if (completedCrop && completedCrop.width > 0 && completedCrop.height > 0) {
-            finalCanvas = getCroppedCanvas(imgRef.current, completedCrop);
-        } else {
-            // トリミング枠が指定されなかった場合は画像全体を使用
-            finalCanvas = document.createElement('canvas');
-            finalCanvas.width = imgRef.current.width;
-            finalCanvas.height = imgRef.current.height;
-            const ctx = finalCanvas.getContext('2d');
-            ctx?.drawImage(imgRef.current, 0, 0);
-        }
-        
-        await performOCR(finalCanvas);
+        await performOCR(finalCanvas, partialDebugInfo);
     };
 
-    const performOCR = async (croppedCanvas: HTMLCanvasElement) => {
+    const performOCR = async (croppedCanvas: HTMLCanvasElement, partialDebugInfo: any) => {
         // OCR処理開始
         setStatus("loading");
         setErrorMessage("");
@@ -226,14 +242,14 @@ export default function ScanPage() {
                 return rc;
             };
 
-            // 1. 患者名領域 (左上: x:0~75%, y:0~40%)
-            const nameCanvas = createRegionCanvas(0, 0, w * 0.75, h * 0.40);
-            // 2. 生年月日領域 (左中上: x:0~75%, y:15~60%)
-            const birthCanvas = createRegionCanvas(0, h * 0.15, w * 0.75, h * 0.45);
-            // 3. 医療機関名領域 (右上: x:35~100%, y:0~55%)
-            const clinicCanvas = createRegionCanvas(w * 0.35, 0, w * 0.65, h * 0.55);
-            // 4. 交付年月日領域 (左中: x:0~75%, y:25~85%)
-            const visitDateCanvas = createRegionCanvas(0, h * 0.25, w * 0.75, h * 0.60);
+            // 1. 患者名領域
+            const nameCanvas = createRegionCanvas(w * OCR_REGIONS.name.x, h * OCR_REGIONS.name.y, w * OCR_REGIONS.name.w, h * OCR_REGIONS.name.h);
+            // 2. 生年月日領域
+            const birthCanvas = createRegionCanvas(w * OCR_REGIONS.birth.x, h * OCR_REGIONS.birth.y, w * OCR_REGIONS.birth.w, h * OCR_REGIONS.birth.h);
+            // 3. 医療機関名領域
+            const clinicCanvas = createRegionCanvas(w * OCR_REGIONS.clinic.x, h * OCR_REGIONS.clinic.y, w * OCR_REGIONS.clinic.w, h * OCR_REGIONS.clinic.h);
+            // 4. 交付年月日領域
+            const visitDateCanvas = createRegionCanvas(w * OCR_REGIONS.visitDate.x, h * OCR_REGIONS.visitDate.y, w * OCR_REGIONS.visitDate.w, h * OCR_REGIONS.visitDate.h);
 
             // 並行タスクで部分OCRを実行
             const nameUrl = canvasToDataUrl(nameCanvas);
@@ -307,7 +323,8 @@ export default function ScanPage() {
                     setErrorMessage("画質が不十分で読み取れません。手入力で検索を開始してください。");
                     
                     if (process.env.NODE_ENV === 'development') {
-                        setAdvancedDebugInfo({
+                        setAdvancedDebugInfo((prev: any) => ({
+                            ...prev,
                             originalUrl: rawImage?.src,
                             preprocessedUrl: cropSrc,
                             croppedUrl: canvasToDataUrl(croppedCanvas),
@@ -318,7 +335,7 @@ export default function ScanPage() {
                                 visit: { url: visitDateUrl, text: visitDateText },
                             },
                             fallbackText: fallbackFullText
-                        });
+                        }));
                     }
                     return;
                 }
@@ -345,7 +362,8 @@ export default function ScanPage() {
             setRawOcrText(finalRawText);
             setCorrectedOcrText(finalCorrectedText);
             setDebugInfo(finalDebugInfo);
-            setAdvancedDebugInfo({
+            setAdvancedDebugInfo((prev: any) => ({
+                ...prev,
                 originalUrl: rawImage?.src,
                 preprocessedUrl: cropSrc,
                 croppedUrl: canvasToDataUrl(croppedCanvas),
@@ -356,7 +374,7 @@ export default function ScanPage() {
                     visit: { url: visitDateUrl, text: visitDateText },
                 },
                 fallbackText: fallbackFullText
-            });
+            }));
 
             // 患者名と交付日のいずれかが空行の場合は警告を出し、プレビューを自動で開く
             if (!pName || !pVisit) {
@@ -479,12 +497,25 @@ export default function ScanPage() {
                             </div>
                         </div>
                     </div>
+                    <div style={{ marginBottom: '16px', padding: '12px', backgroundColor: '#f0f9ff', borderRadius: '4px', border: '1px solid #bae6fd' }}>
+                        <label style={{ fontSize: '0.9rem', display: 'flex', alignItems: 'center', gap: '8px', cursor: 'pointer', color: '#0369a1', fontWeight: 600 }}>
+                            <input 
+                                type="checkbox" 
+                                checked={disableCropping} 
+                                onChange={e => setDisableCropping(e.target.checked)} 
+                                style={{ transform: 'scale(1.2)' }}
+                            />
+                            トリミングを完全に無効化し、画像全体をそのままOCRに渡す（テスト・切り分け用）
+                        </label>
+                    </div>
+                    
                     <ReactCrop 
                         crop={crop} 
                         onChange={c => setCrop(c)} 
                         onComplete={c => setCompletedCrop(c)}
+                        disabled={disableCropping}
                     >
-                        <img ref={imgRef} src={cropSrc} alt="Crop" style={{ maxWidth: '100%' }} />
+                        <img ref={imgRef} src={cropSrc} alt="Crop" style={{ maxWidth: '100%', opacity: disableCropping ? 0.6 : 1 }} />
                     </ReactCrop>
                     <div style={{ marginTop: '16px', display: 'flex', gap: '12px' }}>
                         <button 
@@ -547,7 +578,11 @@ export default function ScanPage() {
                         </div>
                     )}
 
-                    <form onSubmit={handleSearch} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
+                    <div style={{ marginTop: '12px', fontSize: '0.85rem', color: '#64748b', backgroundColor: '#f8fafc', padding: '8px', borderRadius: '4px', border: '1px solid #e2e8f0', display: 'inline-block' }}>
+                        💡 実行モード: {advancedDebugInfo?.isCroppingDisabled ? <strong style={{ color: '#be123c' }}>トリミング無効化（画像全体スキャン）</strong> : <strong>トリミング有効（部分切り抜き）</strong>}
+                    </div>
+
+                    <form onSubmit={handleSearch} style={{ display: 'flex', flexDirection: 'column', gap: '20px', marginTop: '16px' }}>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                             <label htmlFor="patientName" style={{ fontWeight: 600 }}>患者名</label>
                             <input
@@ -663,6 +698,14 @@ export default function ScanPage() {
                             <h3 style={{ fontSize: '1rem', color: '#be123c', marginBottom: '16px', borderBottom: '1px solid #fda4af', paddingBottom: '8px' }}>
                                 🕵️‍♀️ 画像処理・OCR 詳細デバッグ情報
                             </h3>
+
+                            {advancedDebugInfo.originalSize && (
+                                <div style={{ display: 'flex', gap: '16px', backgroundColor: '#fff', padding: '8px', borderRadius: '4px', marginBottom: '16px', fontSize: '0.8rem', fontFamily: 'monospace', border: '1px solid #fecdd3' }}>
+                                    <div><strong>元画像(natural):</strong> {advancedDebugInfo.originalSize.w} x {advancedDebugInfo.originalSize.h}</div>
+                                    <div><strong>表示(css):</strong> {advancedDebugInfo.displaySize.w} x {advancedDebugInfo.displaySize.h}</div>
+                                    <div><strong>OCR対象(crop):</strong> {advancedDebugInfo.croppedSize.w} x {advancedDebugInfo.croppedSize.h}</div>
+                                </div>
+                            )}
                             
                             <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1fr)', gap: '16px', marginBottom: '24px' }}>
                                 <div>
