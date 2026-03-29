@@ -1,6 +1,5 @@
 /**
  * OCR特有の誤認識を事前に補正するルール
- * 今後必要に応じて配列にルールを追加できます。
  */
 export const OCR_CORRECTIONS = [
     { from: /信和/g, to: '令和' },
@@ -29,13 +28,10 @@ export function normalizeDateString(dateStr: string): string {
     let normalized = dateStr.replace(/\s+/g, '');
 
     // 和暦の変換 (令和・平成・昭和・大正・明治)
-    // 例: 令和6年3月29日, 平成30年10月1日, 令和元年5月1日
     const warekiMatch = normalized.match(/(令和|平成|昭和|大正|明治)([元0-9０-９]+)年([0-9０-９]{1,2})月([0-9０-９]{1,2})日?/);
     if (warekiMatch) {
         const era = warekiMatch[1];
         let yearStr = warekiMatch[2];
-        
-        // 「元」は1年に置換し、全角数字は半角に置換
         if (yearStr === '元') yearStr = '1';
         else yearStr = yearStr.replace(/[０-９]/g, (s) => String.fromCharCode(s.charCodeAt(0) - 0xfee0));
         
@@ -72,145 +68,149 @@ export function normalizeDateString(dateStr: string): string {
         return `${y}-${m}-${d}`;
     }
 
-    // どのパターンにも一致しない場合は元の文字列を返す
     return dateStr;
 }
 
-/**
- * テキストから「患者名」を抽出する
- */
-export function extractPatientName(text: string): string {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    
-    // パターン1: 見出し付き
-    const headerPatterns = [
-        /(?:氏名|患者名|受給者氏名)\s*[:：]?\s*([^\n]+)/,
-    ];
-    for (const pattern of headerPatterns) {
-        const match = text.match(pattern);
-        if (match) {
-            const name = match[1].replace(/様$/, '').trim();
-            if (name.length > 0 && name.length < 30) return name;
-        }
-    }
+export interface OcrExtractionResult {
+    correctedText: string;
+    patientName: string;
+    birthDate: string;
+    clinicName: string;
+    visitDate: string;
+    debug: {
+        patientCandidates: string[];
+        birthDateCandidates: string[];
+        clinicCandidates: string[];
+        visitDateCandidates: string[];
+    };
+}
 
-    // パターン2: 「様」で終わる行
-    for (const line of lines) {
-        if (line.endsWith('様') && line.length < 30) {
-            return line.replace(/様$/, '').trim();
+/**
+ * OCRテキストを受け取り、すべての候補を独立抽出し、排他ルールのもと最終値を決定して返す統合ロジック
+ */
+export function extractRecord(rawText: string): OcrExtractionResult {
+    const text = applyCorrections(rawText);
+    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
+    // 候補リスト
+    let patientCandidates: string[] = [];
+    let clinicCandidates: string[] = [];
+    let birthDateCandidates: string[] = [];
+    let visitDateCandidates: string[] = [];
+
+    // 患者名として絶対に見なさない禁止語（これを含む行は患者名から外す）
+    const excludeFromPatient = ['クリニック', '医院', '病院', '診療所', '薬局', 'センター', '医療法人'];
+    // 医療機関名として優先的に拾う語彙
+    const clinicKeywords = ['クリニック', '医院', '病院', '診療所', '医療法人'];
+
+    // --- STEP 1: 各行の走査と候補抽出 ---
+    for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+
+        // ▼医療機関名の候補
+        const clinicMatch = line.match(/(?:医療機関名|保険医療機関|医療機関|病院名)\s*[:：]?\s*(.*)/);
+        if (clinicMatch && clinicMatch[1].trim()) {
+            clinicCandidates.push(clinicMatch[1].trim());
+        } else if (clinicKeywords.some(k => line.includes(k))) {
+            const cleanLine = line.split(/\s+/)[0]; // スペースで区切られるケース対策
+            clinicCandidates.push(cleanLine);
+        } else if (line.match(/^(医療機関名|保険医療機関|医療機関|病院名)\s*[:：]?$/)) {
+            // 見出しの次行にあるケース
+            if (i + 1 < lines.length) clinicCandidates.push(lines[i + 1].trim());
         }
-    }
-    
-    // パターン3: 見出しなし補助ロジック (姓名の間にスペースがあり、数字を含まない2〜15文字の行)
-    for (const line of lines) {
-        if (line.length >= 2 && line.length <= 15) {
-            if (!line.includes('医院') && !line.includes('クリニック') && !line.includes('病院') && !line.match(/[0-9〇]/)) {
-                // 平仮名、カタカナ、漢字、スペースの組み合わせだけなら名前の可能性が高い
-                if (line.match(/^[ぁ-んァ-ン一-龥a-zA-Z]+(?:[\s　]+[ぁ-んァ-ン一-龥a-zA-Z]+)?$/)) {
-                    return line;
+
+        // ▼患者名の候補
+        const patientMatch = line.match(/(?:氏名|患者名|受給者氏名)\s*[:：]?\s*(.*)/);
+        if (patientMatch && patientMatch[1].trim()) {
+            patientCandidates.push(patientMatch[1].replace(/様$/, '').trim());
+        } else if (line.match(/^(氏名|患者名|受給者氏名)\s*[:：]?$/)) {
+            if (i + 1 < lines.length) patientCandidates.push(lines[i + 1].replace(/様$/, '').trim());
+        } else if (line.endsWith('様') && line.length < 30) {
+            patientCandidates.push(line.replace(/様$/, '').trim());
+        } else if (line.length >= 2 && line.length <= 15) {
+            // 見出しなしの救済: 数字などを含まない姓名っぽいもの
+            if (line.match(/^[ぁ-んァ-ン一-龥a-zA-Z]+(?:[\s　]+[ぁ-んァ-ン一-龥a-zA-Z]+)?$/) && !line.match(/[0-9〇]/)) {
+                // ただし禁止語が含まれていたら無視
+                if (!excludeFromPatient.some(k => line.includes(k))) {
+                    patientCandidates.push(line);
                 }
             }
         }
-    }
-    return "";
-}
 
-/**
- * テキストから「生年月日」を抽出する
- */
-export function extractBirthDate(text: string): string {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-
-    // パターン1: 見出し付き
-    const match = text.match(/(?:生年月日|生年)\s*[:：]?\s*([^\n]+)/);
-    if (match) {
-        return normalizeDateString(match[1].trim());
-    }
-
-    // パターン2: 見出しなし補助ロジック (おそらく過去の日付、特に昭和や平成など)
-    for (const line of lines) {
-        // 昭和か平成が含まれていて、日付フォーマットの場合
-        if (line.match(/(昭和|大正|明治|平成)([元0-9０-９]+)年([0-9０-９]{1,2})月([0-9０-９]{1,2})日/)) {
-            return normalizeDateString(line);
+        // ▼生年月日の候補
+        const bDateMatch = line.match(/(?:生年月日|生年)\s*[:：]?\s*(.*)/);
+        if (bDateMatch && bDateMatch[1].trim()) {
+            birthDateCandidates.push(bDateMatch[1].trim());
+        } else if (line.match(/^(生年月日|生年)\s*[:：]?$/)) {
+            if (i + 1 < lines.length) birthDateCandidates.push(lines[i + 1].trim());
+        } else if (line.match(/(昭和|大正|明治|平成)([元0-9０-９]+)年([0-9０-９]{1,2})月([0-9０-９]{1,2})日/)) {
+            birthDateCandidates.push(line);
+        } else if (line.match(/(19[0-9]{2}|200[0-9]|201[0-9])[年\/\.\-]([0-9]{1,2})[月\/\.\-]([0-9]{1,2})/)) {
+            birthDateCandidates.push(line);
         }
-        // 古い西暦（例: 19XX年、200X年）
-        if (line.match(/(19[0-9]{2}|200[0-9]|201[0-9])[年\/\.\-]([0-9]{1,2})[月\/\.\-]([0-9]{1,2})/)) {
-            return normalizeDateString(line);
-        }
-    }
-    return "";
-}
 
-/**
- * テキストから「医療機関名」を抽出する
- */
-export function extractClinicName(text: string): string {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-    
-    // パターン1: 見出し付き
-    const match = text.match(/(?:医療機関名|保険医療機関|名称)\s*[:：]?\s*([^\n]+)/);
-    if (match) {
-        let clinic = match[1].trim();
-        // 見出し行そのものがマッチしてしまうケースを防ぐ
-        if (clinic !== "医療機関名" && clinic !== "保険医療機関") {
-            return clinic;
-        }
-    }
-    
-    // パターン2: 見出しなし補助ロジック (行末が「医院」「クリニック」「病院」「診療所」)
-    for (const line of lines) {
-        if (line.match(/(医院|クリニック|病院|診療所)$/)) {
-            return line;
+        // ▼交付日の候補
+        const vDateMatch = line.match(/(?:交付日|処方日|発行日)\s*[:：]?\s*(.*)/);
+        if (vDateMatch && vDateMatch[1].trim()) {
+            visitDateCandidates.push(vDateMatch[1].trim());
+        } else if (line.match(/^(交付日|処方日|発行日)\s*[:：]?$/)) {
+            if (i + 1 < lines.length) visitDateCandidates.push(lines[i + 1].trim());
+        } else if (line.match(/令和([元0-9０-９]+)年([0-9０-９]{1,2})月([0-9０-９]{1,2})日?/)) {
+            visitDateCandidates.push(line);
+        } else if (line.match(/202[0-9][年\/\.\-]([0-9]{1,2})[月\/\.\-]([0-9]{1,2})/)) {
+            visitDateCandidates.push(line);
         }
     }
 
-    // パターン3: 見出しなし補助ロジック (行の途中に「医院」「クリニック」「病院」「診療所」を含む)
-    for (const line of lines) {
-        if (line.match(/(医院|クリニック|病院|診療所)/)) {
-            return line.split(/\s+/)[0]; // スペース等で区切られた最初の語彙を返す
-        }
-    }
-    
-    return "";
-}
+    // --- STEP 2: 排他ルールに基づく項目確定 ---
+    let finalPatientName = "";
+    let finalClinicName = "";
+    let finalBirthDate = "";
+    let finalVisitDate = "";
 
-/**
- * テキストから「交付日（訪問日）」を抽出する
- */
-export function extractVisitDate(text: string): string {
-    const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
-
-    // パターン1: 見出し付き
-    const match = text.match(/(?:交付|処方|発行)[年月日]*\s*[:：]?\s*([^\n]+)/);
-    if (match) {
-        return normalizeDateString(match[1].trim());
+    // 1. 生年月日
+    if (birthDateCandidates.length > 0) {
+        finalBirthDate = normalizeDateString(birthDateCandidates[0]);
     }
 
-    // パターン2: 見出しなし補助ロジック (最近の日付、特に令和か今年度に近い西暦)
-    for (const line of lines) {
-        // 令和が含まれていて、日付フォーマットの場合
-        if (line.match(/令和([元0-9０-９]+)年([0-9０-９]{1,2})月([0-9０-９]{1,2})日/)) {
-            return normalizeDateString(line);
-        }
-        // 最近の西暦（例: 202X年）
-        if (line.match(/202[0-9][年\/\.\-]([0-9]{1,2})[月\/\.\-]([0-9]{1,2})/)) {
-            return normalizeDateString(line);
+    // 2. 交付日 (生年月日と被っているものは回避)
+    for (const cand of visitDateCandidates) {
+        const norm = normalizeDateString(cand);
+        if (norm !== finalBirthDate && norm !== "") {
+            finalVisitDate = norm;
+            break;
         }
     }
-    return "";
-}
 
-/**
- * OCRテキストを受け取り、すべての項目を抽出してオブジェクトで返す
- */
-export function extractRecord(rawText: string) {
-    const text = applyCorrections(rawText);
+    // 3. 医療機関名 (必ず先にアサインして保護)
+    for (const cand of clinicCandidates) {
+        if (cand && cand.length > 0) {
+            finalClinicName = cand;
+            break;
+        }
+    }
+
+    // 4. 患者名 (医療機関名と被ったり、禁止語を含むものは厳密に除外)
+    for (const cand of patientCandidates) {
+        if (!cand) continue;
+        if (cand === finalClinicName) continue;
+        if (excludeFromPatient.some(k => cand.includes(k))) continue;
+        
+        finalPatientName = cand;
+        break;
+    }
 
     return {
         correctedText: text,
-        patientName: extractPatientName(text),
-        birthDate: extractBirthDate(text),
-        clinicName: extractClinicName(text),
-        visitDate: extractVisitDate(text),
+        patientName: finalPatientName,
+        birthDate: finalBirthDate,
+        clinicName: finalClinicName,
+        visitDate: finalVisitDate,
+        debug: {
+            patientCandidates,
+            clinicCandidates,
+            birthDateCandidates,
+            visitDateCandidates
+        }
     };
 }

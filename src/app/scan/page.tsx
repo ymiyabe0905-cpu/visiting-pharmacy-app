@@ -25,6 +25,7 @@ export default function ScanPage() {
     // OCR全文プレビュー用ステート
     const [rawOcrText, setRawOcrText] = useState("");
     const [correctedOcrText, setCorrectedOcrText] = useState("");
+    const [debugInfo, setDebugInfo] = useState<any>(null);
     const [showRawOcrText, setShowRawOcrText] = useState(false);
 
     // 画像が不要になった時点でメモリから速やかに破棄するための関数
@@ -78,6 +79,7 @@ export default function ScanPage() {
             setVisitDate(extracted.visitDate);
             setRawOcrText(text);
             setCorrectedOcrText(extracted.correctedText);
+            setDebugInfo(extracted.debug);
 
             // 必須項目が1つでも空行になった場合は警告を出し、プレビューを自動で開く
             if (!extracted.patientName || !extracted.clinicName || !extracted.visitDate) {
@@ -106,6 +108,7 @@ export default function ScanPage() {
         setVisitDate("");
         setRawOcrText("");
         setCorrectedOcrText("");
+        setDebugInfo(null);
         setShowRawOcrText(false);
         setErrorMessage("");
         setWarningMessage("");
@@ -267,6 +270,29 @@ export default function ScanPage() {
                                         {rawOcrText || 'テキストなし'}
                                     </div>
                                 </div>
+                                
+                                {debugInfo && (
+                                <div>
+                                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '4px' }}>内部抽出デバッグ情報（候補リストと実際の採用値）:</div>
+                                    <div style={{ padding: '12px', backgroundColor: '#fff7ed', border: '1px solid #fed7aa', borderRadius: '4px', whiteSpace: 'pre-wrap', fontSize: '0.85rem', color: '#9a3412', overflowY: 'auto', fontFamily: 'monospace', lineHeight: 1.6 }}>
+                                        <strong>◆ 医療機関名候補</strong><br/>
+                                        {debugInfo.clinicCandidates?.length > 0 ? debugInfo.clinicCandidates.join(', ') : 'なし'}<br/>
+                                        <span style={{ color: '#ea580c' }}>→ 【採用】 {clinicName || 'なし'}</span><br/><br/>
+
+                                        <strong>◆ 患者名候補</strong><br/>
+                                        {debugInfo.patientCandidates?.length > 0 ? debugInfo.patientCandidates.join(', ') : 'なし'}<br/>
+                                        <span style={{ color: '#ea580c' }}>→ 【採用】 {patientName || 'なし'}</span><br/><br/>
+                                        
+                                        <strong>◆ 生年月日候補</strong><br/>
+                                        {debugInfo.birthDateCandidates?.length > 0 ? debugInfo.birthDateCandidates.join(', ') : 'なし'}<br/>
+                                        <span style={{ color: '#ea580c' }}>→ 【採用】 {birthDate || 'なし'}</span><br/><br/>
+                                        
+                                        <strong>◆ 交付日候補</strong><br/>
+                                        {debugInfo.visitDateCandidates?.length > 0 ? debugInfo.visitDateCandidates.join(', ') : 'なし'}<br/>
+                                        <span style={{ color: '#ea580c' }}>→ 【採用】 {visitDate || 'なし'}</span>
+                                    </div>
+                                </div>
+                                )}
                             </div>
                         )}
                     </div>
