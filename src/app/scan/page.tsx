@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect } from "react";
 import { useRouter } from "next/navigation";
 import Tesseract from "tesseract.js";
+import { extractRecord } from "@/lib/ocr/extractor";
 
 type OcrStatus = "idle" | "loading" | "success" | "error";
 
@@ -13,6 +14,7 @@ export default function ScanPage() {
 
     const [status, setStatus] = useState<OcrStatus>("idle");
     const [errorMessage, setErrorMessage] = useState<string>("");
+    const [warningMessage, setWarningMessage] = useState<string>("");
 
     // OCR結果・フォーム用ステート
     const [patientName, setPatientName] = useState("");
@@ -22,6 +24,7 @@ export default function ScanPage() {
 
     // OCR全文プレビュー用ステート
     const [rawOcrText, setRawOcrText] = useState("");
+    const [correctedOcrText, setCorrectedOcrText] = useState("");
     const [showRawOcrText, setShowRawOcrText] = useState(false);
 
     // 画像が不要になった時点でメモリから速やかに破棄するための関数
@@ -49,6 +52,7 @@ export default function ScanPage() {
         // OCR処理開始
         setStatus("loading");
         setErrorMessage("");
+        setWarningMessage("");
 
         try {
             // 本来はjpnとするが、読み込みに時間がかかるため今回はモジュールの制限に注意しつつjpnを使用する想定
@@ -58,24 +62,26 @@ export default function ScanPage() {
 
             const text = result.data.text;
 
-            // 簡易的な抽出ロジック (本来は正規表現等でより高度に抽出)
-            // 注意: XSS対策のため、このtextをinnerHTML等には絶対入れないこと。
-            // Reactのステート管理を通じてフォームのvalueにのみバインドします。
+            // 文字が極端に少ない場合は再撮影を促す
+            if (text.trim().length < 5) {
+                setStatus("error");
+                setErrorMessage("OCR結果が不十分です。もう一度撮影（選択）してください。");
+                return;
+            }
 
-            // ここに抽出処理（モックとして適当に設定）
-            const extractedName = extractPattern(text, /氏名\s*[:：]?\s*([^\n]+)/) || "自動抽出失敗（手入力してください）";
-            const extractedBirth = extractPattern(text, /生年月日\s*[:：]?\s*([^\n]+)/) || "";
-            const extractedClinic = extractPattern(text, /(医院|クリニック|病院|診療所)/, true) || "";
-            const extractedDate = extractPattern(text, /交付[年月日時分]+\s*[:：]?\s*([^\n]+)/) || "";
+            // 新しい切り出しモジュールで抽出
+            const extracted = extractRecord(text);
 
-            setPatientName(extractedName);
-            setBirthDate(extractedBirth);
-            setClinicName(extractedClinic);
-            setVisitDate(extractedDate);
+            setPatientName(extracted.patientName);
+            setBirthDate(extracted.birthDate);
+            setClinicName(extracted.clinicName);
+            setVisitDate(extracted.visitDate);
             setRawOcrText(text);
+            setCorrectedOcrText(extracted.correctedText);
 
-            // 抽出に失敗した（患者名が取れなかった）場合は自動展開する
-            if (extractedName === "自動抽出失敗（手入力してください）" || text.trim() === "") {
+            // 必須項目が1つでも空行になった場合は警告を出し、プレビューを自動で開く
+            if (!extracted.patientName || !extracted.clinicName || !extracted.visitDate) {
+                setWarningMessage("一部項目の抽出に失敗しました。OCR全文を確認して修正してください。");
                 setShowRawOcrText(true);
             } else {
                 setShowRawOcrText(false);
@@ -90,11 +96,6 @@ export default function ScanPage() {
         }
     };
 
-    const extractPattern = (text: string, regex: RegExp, includeMatch = false) => {
-        const match = text.match(regex);
-        if (!match) return null;
-        return includeMatch ? match[0] : match[1];
-    };
 
     const handleRetake = () => {
         cleanupImage();
@@ -104,8 +105,10 @@ export default function ScanPage() {
         setClinicName("");
         setVisitDate("");
         setRawOcrText("");
+        setCorrectedOcrText("");
         setShowRawOcrText(false);
         setErrorMessage("");
+        setWarningMessage("");
         if (fileInputRef.current) {
             fileInputRef.current.value = "";
         }
@@ -172,9 +175,15 @@ export default function ScanPage() {
 
             {status === 'success' && (
                 <div>
-                    <div style={{ marginBottom: '24px', padding: '16px', backgroundColor: '#ecfdf5', color: '#047857', borderRadius: '8px' }}>
-                        読み取りが完了しました。内容を確認し、必要に応じて修正してください。
-                    </div>
+                    {warningMessage ? (
+                        <div style={{ marginBottom: '24px', padding: '16px', backgroundColor: '#fffbeb', color: '#b45309', borderRadius: '8px', borderLeft: '4px solid #f59e0b' }}>
+                            {warningMessage}
+                        </div>
+                    ) : (
+                        <div style={{ marginBottom: '24px', padding: '16px', backgroundColor: '#ecfdf5', color: '#047857', borderRadius: '8px', borderLeft: '4px solid #10b981' }}>
+                            読み取りが完了しました。内容を確認し、必要に応じて修正してください。
+                        </div>
+                    )}
 
                     <form onSubmit={handleSearch} style={{ display: 'flex', flexDirection: 'column', gap: '20px' }}>
                         <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
@@ -245,8 +254,19 @@ export default function ScanPage() {
                             <span>{showRawOcrText ? '▲ 閉じる' : '▼ 開く'}</span>
                         </div>
                         {showRawOcrText && (
-                            <div style={{ marginTop: '16px', padding: '12px', backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '4px', whiteSpace: 'pre-wrap', fontSize: '0.85rem', color: 'var(--text-main)', maxHeight: '300px', overflowY: 'auto', fontFamily: 'monospace' }}>
-                                {rawOcrText || 'テキストを抽出できませんでした。画像がぼやけているか、文字が含まれていない可能性があります。'}
+                            <div style={{ marginTop: '16px', display: 'flex', flexDirection: 'column', gap: '12px' }}>
+                                <div>
+                                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '4px' }}>誤認識自動補正後テキスト（抽出対象）:</div>
+                                    <div style={{ padding: '12px', backgroundColor: '#f0fdf4', border: '1px solid #bbf7d0', borderRadius: '4px', whiteSpace: 'pre-wrap', fontSize: '0.85rem', color: 'var(--text-main)', maxHeight: '150px', overflowY: 'auto', fontFamily: 'monospace' }}>
+                                        {correctedOcrText || 'テキストなし'}
+                                    </div>
+                                </div>
+                                <div>
+                                    <div style={{ fontSize: '0.8rem', color: 'var(--text-muted)', marginBottom: '4px' }}>OCR生テキスト（Tesseract.js出力）:</div>
+                                    <div style={{ padding: '12px', backgroundColor: '#ffffff', border: '1px solid #e2e8f0', borderRadius: '4px', whiteSpace: 'pre-wrap', fontSize: '0.85rem', color: 'var(--text-main)', maxHeight: '150px', overflowY: 'auto', fontFamily: 'monospace' }}>
+                                        {rawOcrText || 'テキストなし'}
+                                    </div>
+                                </div>
                             </div>
                         )}
                     </div>
